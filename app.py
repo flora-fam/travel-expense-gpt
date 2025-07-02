@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from query import query_pinecone
-from expense_gpt_response import query_expense_gpt  # ✅ GPT integration
+from expense_gpt_response import query_expense_gpt  # GPT integration
 
 app = FastAPI()
 
@@ -28,3 +28,8 @@ def ask_expense_gpt(request: QueryRequest):
 @app.get("/")
 def health_check():
     return {"status": "ok"}
+
+# ✅ Ensure Render detects correct port
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
