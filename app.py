@@ -1,13 +1,16 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import openai
-from pinecone import Pinecone
+import pinecone
+import os
 
-# ✅ Hardcoded API keys (your real values)
-openai.api_key = "OPENAI_API_KEY"
-pc = Pinecone(api_key="PINECONE_API_KEY")
+# ✅ Load API keys from environment
+openai.api_key = os.getenv("OPENAI_API_KEY")
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
 
-index = pc.Index("auditexpense2")  # ✅ Your active Pinecone index
+# ✅ Init Pinecone
+pinecone.init(api_key=pinecone_api_key)
+index = pinecone.Index("auditexpense2")
 
 # ✅ Flask app
 app = Flask(__name__)
