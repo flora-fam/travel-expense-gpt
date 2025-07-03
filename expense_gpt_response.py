@@ -1,7 +1,10 @@
 # expense_gpt_response.py
 
-import openai
 from query import query_pinecone
+from openai import OpenAI
+import os
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def query_expense_gpt(question: str, top_k: int = 5):
     try:
@@ -20,16 +23,13 @@ Question:
 
 Answer:"""
 
-        print("📤 Sending to GPT:", prompt[:500])  # only show the start of prompt
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}]
         )
 
-        answer = response.choices[0].message.content
-        print("✅ GPT answered.")
-        return answer
+        return response.choices[0].message.content
 
     except Exception as e:
-        print("❌ Error in query_expense_gpt:", str(e))
+        print("❌ GPT error:", str(e))
         return f"Error: {str(e)}"
