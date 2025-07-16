@@ -1,7 +1,7 @@
 from query import query_pinecone
 from openai import OpenAI
 import os
-import pandas as pd  # NEW: needed for mutual approval logic
+import pandas as pd  # Needed for logic and formatting
 
 # ✅ Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -11,7 +11,7 @@ def query_expense_gpt(question: str, top_k: int = 5):
         # ✅ Get Pinecone matches
         matches = query_pinecone(question, top_k)
 
-        # ✅ Extract content from metadata — handle fallback keys
+        # ✅ Extract content and metadata
         context_chunks = []
         rows = []
 
@@ -19,15 +19,16 @@ def query_expense_gpt(question: str, top_k: int = 5):
             metadata = match["metadata"]
             content = metadata.get("content") or metadata.get("text_chunk") or str(metadata)
             context_chunks.append(content)
-            rows.append(metadata)  # NEW: collect all rows
+            rows.append(metadata)
 
         context = "\n---\n".join(context_chunks)
 
-        # ✅ Load into DataFrame for mutual approval detection
+        # ✅ Load into DataFrame for business logic
         df = pd.DataFrame(rows)
         df["Employee ID"] = df["Employee ID"].astype(str).str.strip()
         df["Default Approver ID"] = df["Default Approver ID"].astype(str).str.strip()
 
+        # ✅ Bi-directional mutual approval detection
         pairs = set(zip(df["Employee ID"], df["Default Approver ID"]))
         mutual_pairs = set()
         for a, b in pairs:
@@ -36,7 +37,12 @@ def query_expense_gpt(question: str, top_k: int = 5):
 
         mutual_pairs_text = "\n".join([f"{a} ⇄ {b}" for a, b in sorted(mutual_pairs)]) or "None detected"
 
-        # ✅ Structured system prompt with mutual pairs injected
+        # ✅ Top 5 approvers by volume
+        top_approvers = df["Default Approver"].value_counts().head(5).reset_index()
+        top_approvers.columns = ["Approver", "Approval Count"]
+        approver_text = "\n".join(f"{a.strip()} – {c} approvals" for a, c in top_approvers.values)
+
+        # ✅ Compose GPT prompt
         prompt = f"""
 You are a travel and expense audit assistant. Use the context below to answer the user's question.
 
@@ -46,12 +52,16 @@ Context:
 Mutual Approval Pairs (based on bi-directional approval logic):
 {mutual_pairs_text}
 
+Top Approvers by Volume:
+{approver_text}
+
 Question:
 {question}
 
-Answer:"""
+Answer:
+"""
 
-        # ✅ Call GPT with correct model
+        # ✅ Call GPT
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}],
