@@ -41,50 +41,78 @@ def health_check():
 # ---------- Debug helpers ----------
 @app.get("/debug-config")
 def debug_config():
-    """Shows which index/namespace and key presence; also returns Pinecone vector counts."""
+    """
+    Shows which index/namespace and key presence; also returns Pinecone vector counts.
+    Never throws — returns an 'info' object even if something is misconfigured.
+    """
     info = {
-        "index_name": os.getenv("INDEX_NAME", "auditexpense2"),
+        "index_name": os.getenv("INDEX_NAME"),
         "namespace": os.getenv("PINECONE_NAMESPACE", ""),
         "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
         "pinecone_key_set": bool(os.getenv("PINECONE_API_KEY")),
     }
     try:
-        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-        idx = pc.Index(info["index_name"])
+        pk = os.getenv("PINECONE_API_KEY")
+        iname = os.getenv("INDEX_NAME")
+        if not pk or not iname:
+            info["warning"] = "Missing PINECONE_API_KEY or INDEX_NAME"
+            return info
+
+        pc = Pinecone(api_key=pk)
+        idx = pc.Index(iname)
         stats = idx.describe_index_stats()
-        info["total_vector_count"] = stats.get("total_vector_count")
-        info["namespaces"] = stats.get("namespaces")
+
+        # Safely serialize
+        info["total_vector_count"] = int(stats.get("total_vector_count", 0))
+        namespaces = stats.get("namespaces") or {}
+        info["namespaces"] = list(namespaces.keys()) if isinstance(namespaces, dict) else namespaces
+        return info
     except Exception as e:
         info["pinecone_error"] = str(e)
-    return info
+        return info
 
 
 @app.post("/debug-query")
 def debug_query(request: QueryRequest):
-    """Runs a raw Pinecone query (no GPT) to inspect hits/Doc_ID diversity."""
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    index_name = os.getenv("INDEX_NAME", "auditexpense2")
-    namespace = os.getenv("PINECONE_NAMESPACE", "")
-    idx = pc.Index(index_name)
+    """
+    Runs a raw Pinecone query (no GPT) to inspect hits/Doc_ID diversity.
+    Helpful to confirm retrieval is working and varied.
+    """
+    try:
+        pk = os.getenv("PINECONE_API_KEY")
+        iname = os.getenv("INDEX_NAME")
+        namespace = os.getenv("PINECONE_NAMESPACE", "")
+        if not pk or not iname:
+            return {
+                "error": "Missing PINECONE_API_KEY or INDEX_NAME",
+                "index_name": iname,
+                "namespace": namespace,
+            }
 
-    qvec = _embed_query(request.question)  # 1024-dim
-    res = idx.query(
-        vector=qvec,
-        top_k=max(20, request.top_k * 3),
-        include_metadata=True,
-        include_values=False,
-        namespace=namespace
-    )
-    hits = []
-    for m in (res.get("matches") or [])[:15]:
-        md = m.get("metadata") or {}
-        hits.append({
-            "id": m.get("id"),
-            "score": round(m.get("score", 0.0), 4),
-            "Doc_ID": md.get("Doc_ID") or md.get("document_id"),
-            "snippet": (md.get("Content") or md.get("content") or md.get("text_chunk") or "")[:140]
-        })
-    return {"index_name": index_name, "namespace": namespace, "hits": hits}
+        pc = Pinecone(api_key=pk)
+        idx = pc.Index(iname)
+
+        qvec = _embed_query(request.question)  # 1024-dim to match your index
+        res = idx.query(
+            vector=qvec,
+            top_k=max(20, request.top_k * 3),
+            include_metadata=True,
+            include_values=False,
+            namespace=namespace
+        )
+
+        hits = []
+        for m in (res.get("matches") or [])[:15]:
+            md = m.get("metadata") or {}
+            hits.append({
+                "id": m.get("id"),
+                "score": round(m.get("score", 0.0), 4),
+                "Doc_ID": md.get("Doc_ID") or md.get("document_id"),
+                "snippet": (md.get("Content") or md.get("content") or md.get("text_chunk") or "")[:140]
+            })
+        return {"index_name": iname, "namespace": namespace, "hits": hits}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ---------- Local run (Render uses its own start command) ----------
