@@ -123,7 +123,8 @@ def _is_analytics_question(question: str) -> bool:
         "top spenders", "top categories", "top merchants", "monthly trend",
         "biggest spenders", "highest spenders", "most expensive", "spending by",
         "breakdown by", "summary", "analytics", "who spent", "which employee",
-        "top 10", "top 5", "ranking", "leaderboard"
+        "top 10", "top 5", "ranking", "leaderboard", "global summaries",
+        "show me summaries", "overview", "spending patterns", "expense analysis"
     ]
     question_lower = question.lower()
     return any(keyword in question_lower for keyword in analytics_keywords)
