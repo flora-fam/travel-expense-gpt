@@ -1,5 +1,5 @@
 # expense_gpt_response.py
-# Diversified RAG + optional GLOBAL summaries stored inside Pinecone (no CSV required).
+# Hybrid approach: Vector search + CSV analysis for complete accuracy
 # Env vars:
 #   OPENAI_API_KEY, PINECONE_API_KEY, INDEX_NAME (e.g., auditexpense2), PINECONE_NAMESPACE (optional)
 
@@ -10,6 +10,7 @@ import numpy as np
 import networkx as nx
 from openai import OpenAI
 from pinecone import Pinecone
+import io
 
 # ---------- Config ----------
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,6 +21,232 @@ NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 client = OpenAI(api_key=OPENAI_KEY)
 pc = Pinecone(api_key=PINECONE_KEY)
 index = pc.Index(INDEX_NAME)
+
+# Global variable to cache CSV data
+_cached_csv_data = None
+
+# ---------- CSV Analysis Functions ----------
+def _load_csv_data():
+    """Load and cache the CSV data for complete analysis."""
+    global _cached_csv_data
+    
+    if _cached_csv_data is not None:
+        return _cached_csv_data
+    
+    try:
+        # Try to read the CSV file from current directory
+        # In your deployment, make sure TNE Data_Updated_Flora.csv is in the same directory
+        df = pd.read_csv('TNE Data_Updated_Flora.csv', encoding='cp1252')
+        
+        # Clean and standardize column names
+        df.columns = df.columns.str.strip()
+        
+        # Convert amount columns to numeric
+        amount_cols = ['Expense Amount (rpt)', 'Approved Amount (rpt)']
+        for col in amount_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Convert ID columns to strings for consistent comparison
+        id_cols = ['Employee ID', 'Default Approver ID']
+        for col in id_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+        
+        # Convert date columns
+        date_cols = ['Transaction Date', 'Created Date', 'Paid Date', 'Report Date']
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        _cached_csv_data = df
+        print(f"Loaded CSV data: {len(df)} records")
+        return df
+        
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        return None
+
+def _is_csv_analysis_question(question: str) -> bool:
+    """Determine if question requires complete CSV analysis for accuracy."""
+    csv_keywords = [
+        # Governance violations requiring 100% accuracy
+        "mutual approval", "approved each other", "self approval", "self-approval",
+        "threshold dodging", "circular approval", "approval ring",
+        
+        # Financial totals requiring exact counts
+        "total expense", "total amount", "total spending", "grand total",
+        "how many records", "count of", "total count", "dataset size",
+        "total value", "sum of", "aggregate",
+        
+        # Compliance requiring complete audit trail
+        "missing receipts", "receipt compliance", "policy violation",
+        "approval delays over", "processing time", "unapproved expenses",
+        
+        # Data quality requiring full scan
+        "duplicate", "missing data", "data quality", "inconsistent",
+        "zero amount", "negative amount", "data integrity",
+        
+        # Exact vendor/employee analysis
+        "all vendors", "complete list", "every employee", "full breakdown",
+        "exact number", "precise count", "audit trail",
+        
+        # Critical audit queries
+        "governance violation", "control breakdown", "fraud detection",
+        "compliance issue", "audit finding", "risk assessment"
+    ]
+    
+    question_lower = question.lower()
+    return any(keyword in question_lower for keyword in csv_keywords)
+
+def _analyze_mutual_approvals(df):
+    """Find all mutual approval relationships in the complete dataset."""
+    if df is None or len(df) == 0:
+        return {"mutual_pairs": [], "total_cases": 0, "analysis": "No data available"}
+    
+    # Create approval relationship mapping
+    approval_pairs = {}
+    
+    for _, row in df.iterrows():
+        emp_id = str(row.get('Employee ID', '')).strip()
+        app_id = str(row.get('Default Approver ID', '')).strip()
+        
+        if emp_id and app_id and emp_id != app_id:
+            key = f"{emp_id}-{app_id}"
+            if key not in approval_pairs:
+                approval_pairs[key] = []
+            
+            approval_pairs[key].append({
+                'employee': row.get('Employee', ''),
+                'approver': row.get('Default Approver', ''),
+                'amount': row.get('Expense Amount (rpt)', 0),
+                'date': row.get('Transaction Date', ''),
+                'report_id': row.get('Report ID', '')
+            })
+    
+    # Find mutual approvals
+    mutual_cases = []
+    processed_pairs = set()
+    
+    for key, transactions in approval_pairs.items():
+        emp_id, app_id = key.split('-')
+        reverse_key = f"{app_id}-{emp_id}"
+        pair_key = tuple(sorted([emp_id, app_id]))
+        
+        if reverse_key in approval_pairs and pair_key not in processed_pairs:
+            processed_pairs.add(pair_key)
+            
+            forward_txns = transactions
+            reverse_txns = approval_pairs[reverse_key]
+            
+            total_forward_amount = sum(t['amount'] for t in forward_txns if t['amount'])
+            total_reverse_amount = sum(t['amount'] for t in reverse_txns if t['amount'])
+            
+            mutual_cases.append({
+                'employee_1_id': emp_id,
+                'employee_2_id': app_id,
+                'employee_1_name': forward_txns[0]['employee'] if forward_txns else '',
+                'employee_2_name': reverse_txns[0]['employee'] if reverse_txns else '',
+                'forward_transactions': len(forward_txns),
+                'reverse_transactions': len(reverse_txns),
+                'forward_amount': total_forward_amount,
+                'reverse_amount': total_reverse_amount,
+                'total_amount': total_forward_amount + total_reverse_amount
+            })
+    
+    return {
+        "mutual_pairs": mutual_cases,
+        "total_cases": len(mutual_cases),
+        "analysis": f"Found {len(mutual_cases)} mutual approval relationships in complete dataset"
+    }
+
+def _analyze_complete_dataset(question: str, df):
+    """Perform complete dataset analysis for critical audit questions."""
+    if df is None:
+        return "Error: Unable to load complete dataset for analysis"
+    
+    question_lower = question.lower()
+    
+    # Handle specific analysis types
+    if "mutual approval" in question_lower or "approved each other" in question_lower:
+        result = _analyze_mutual_approvals(df)
+        
+        if result["total_cases"] == 0:
+            return "**No mutual approvals detected** in the complete dataset of {:,} records.".format(len(df))
+        
+        response = f"**Found {result['total_cases']} mutual approval relationships** in {:,} total records:\n\n"
+        
+        for i, case in enumerate(result["mutual_pairs"], 1):
+            response += f"{i}. **{case['employee_1_name']} (ID: {case['employee_1_id']})** ⇄ **{case['employee_2_name']} (ID: {case['employee_2_id']})**\n"
+            response += f"   - {case['employee_1_name']} → {case['employee_2_name']}: {case['forward_transactions']} transactions, ${case['forward_amount']:,.2f}\n"
+            response += f"   - {case['employee_2_name']} → {case['employee_1_name']}: {case['reverse_transactions']} transactions, ${case['reverse_amount']:,.2f}\n"
+            response += f"   - **Total mutual approval amount: ${case['total_amount']:,.2f}**\n\n"
+        
+        response += "**Audit Risk:** Mutual approvals represent potential conflicts of interest and control violations requiring immediate review."
+        return response
+    
+    elif "total" in question_lower and ("record" in question_lower or "count" in question_lower):
+        return f"The complete dataset contains **{len(df):,} expense records** with a total expense amount of **${df['Expense Amount (rpt)'].sum():,.2f}**."
+    
+    elif "self approval" in question_lower or "self-approval" in question_lower:
+        self_approvals = df[df['Employee ID'] == df['Default Approver ID']]
+        if len(self_approvals) == 0:
+            return f"**No self-approvals detected** in the complete dataset of {len(df):,} records."
+        
+        total_amount = self_approvals['Expense Amount (rpt)'].sum()
+        return f"**Found {len(self_approvals)} self-approval violations** totaling **${total_amount:,.2f}** across {len(df):,} total records. This represents a critical control breakdown requiring immediate investigation."
+    
+    elif "threshold dodging" in question_lower or ("4800" in question_lower and "5000" in question_lower):
+        threshold_expenses = df[(df['Expense Amount (rpt)'] >= 4800) & (df['Expense Amount (rpt)'] <= 5000)]
+        
+        if len(threshold_expenses) == 0:
+            return "**No threshold dodging detected** - no expenses found between $4,800 and $5,000 in the complete dataset."
+        
+        by_type = threshold_expenses.groupby('Expense Type').agg({
+            'Expense Amount (rpt)': ['count', 'sum']
+        }).round(2)
+        
+        response = f"**Found {len(threshold_expenses)} potential threshold dodging cases** between $4,800-$5,000:\n\n"
+        
+        for expense_type, data in by_type.iterrows():
+            count = data[('Expense Amount (rpt)', 'count')]
+            total = data[('Expense Amount (rpt)', 'sum')]
+            response += f"- **{expense_type}**: {count} transactions, ${total:,.2f}\n"
+        
+        response += f"\n**Total suspicious amount: ${threshold_expenses['Expense Amount (rpt)'].sum():,.2f}**"
+        response += "\n**Audit Risk:** Pattern suggests potential policy circumvention to avoid higher approval thresholds."
+        return response
+    
+    elif "top" in question_lower and "spender" in question_lower:
+        # Extract number from question (default to 10)
+        import re
+        numbers = re.findall(r'\d+', question)
+        top_n = int(numbers[0]) if numbers else 10
+        
+        top_spenders = df.groupby(['Employee', 'Employee ID'])['Expense Amount (rpt)'].sum().sort_values(ascending=False).head(top_n)
+        
+        response = f"**Top {top_n} Spenders** (complete dataset analysis):\n\n"
+        for i, ((name, emp_id), amount) in enumerate(top_spenders.items(), 1):
+            response += f"{i}. **{name}** (ID: {emp_id}) — ${amount:,.2f}\n"
+        
+        response += f"\n**Analysis based on complete dataset of {len(df):,} records**"
+        return response
+    
+    # Add more specific analysis types as needed...
+    
+    # Generic complete dataset summary
+    total_amount = df['Expense Amount (rpt)'].sum()
+    unique_employees = df['Employee ID'].nunique()
+    unique_vendors = df['Vendor'].nunique() if 'Vendor' in df.columns else 0
+    
+    return f"""**Complete Dataset Analysis**:
+- **Total Records**: {len(df):,}
+- **Total Expense Amount**: ${total_amount:,.2f}
+- **Unique Employees**: {unique_employees:,}
+- **Unique Vendors**: {unique_vendors:,}
+- **Date Range**: {df['Transaction Date'].min()} to {df['Transaction Date'].max()}
+
+For specific audit analysis, please ask about mutual approvals, self-approvals, threshold dodging, or other compliance patterns."""
 
 # ---------- Embedding ----------
 def _embed_query(text: str) -> list:
@@ -431,7 +658,13 @@ def _format_global_text(glob):
 # ---------- Main entry ----------
 def query_expense_gpt(question: str, top_k: int = 10):
     try:
-        # FIRST: Check if this is a count question
+        # FIRST: Check if this requires complete CSV analysis for 100% accuracy
+        if _is_csv_analysis_question(question):
+            print(f"Using CSV analysis for critical audit question: {question}")
+            csv_data = _load_csv_data()
+            return _analyze_complete_dataset(question, csv_data)
+        
+        # SECOND: Check if this is a basic count question
         if _is_count_question(question):
             total_count = _get_total_record_count()
             if total_count is not None:
@@ -439,7 +672,7 @@ def query_expense_gpt(question: str, top_k: int = 10):
             else:
                 return "I couldn't retrieve the total record count from the database."
         
-        # SECOND: Handle analytics questions with large representative sampling
+        # THIRD: Handle analytics questions with large representative sampling
         if _is_analytics_question(question):
             # Get a large, diverse sample for robust analytics
             rows = _get_large_representative_sample(question, sample_size=800)
