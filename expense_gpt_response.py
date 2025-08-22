@@ -174,7 +174,7 @@ def _analyze_complete_dataset(question: str, df):
         if result["total_cases"] == 0:
             return "**No mutual approvals detected** in the complete dataset of {:,} records.".format(len(df))
         
-        response = f"**Found {result['total_cases']} mutual approval relationships** in {:,} total records:\n\n"
+        response = f"**Found {result['total_cases']} mutual approval relationships** in {len(df):,} total records:\n\n"
         
         for i, case in enumerate(result["mutual_pairs"], 1):
             response += f"{i}. **{case['employee_1_name']} (ID: {case['employee_1_id']})** ⇄ **{case['employee_2_name']} (ID: {case['employee_2_id']})**\n"
