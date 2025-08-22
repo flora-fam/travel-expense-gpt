@@ -24,7 +24,7 @@ index = pc.Index(INDEX_NAME)
 
 # ---------- Embedding ----------
 def _embed_query(text: str) -> list:
-    """Embed with same dimension as your index (1024). Exported for app.py debug endpoints."""
+    """Embed with same dimension as your index (1024)."""
     emb = client.embeddings.create(
         model="text-embedding-3-large",
         input=text,
@@ -32,134 +32,123 @@ def _embed_query(text: str) -> list:
     ).data[0].embedding
     return emb
 
-# ---------- MMR reranking (diversify retrieval) ----------
-def _l2norm(a: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
-    return a / n
-
-def _cos_sim(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    return _l2norm(A) @ _l2norm(B).T
-
-def _mmr(doc_embs: np.ndarray, query_emb: np.ndarray, k: int, lam: float = 0.5):
-    if doc_embs.size == 0:
-        return []
-    q = query_emb.reshape(1, -1)
-    sim_q = _cos_sim(doc_embs, q).flatten()
-
-    selected = []
-    cand = list(range(len(doc_embs)))
-
-    # start with most relevant
-    first = int(np.argmax(sim_q))
-    selected.append(first)
-    cand.remove(first)
-
-    while len(selected) < min(k, len(doc_embs)) and cand:
-        sel_embs = doc_embs[np.array(selected)]
-        sim_to_sel = _cos_sim(doc_embs[cand], sel_embs).max(axis=1)
-        scores = lam * sim_q[cand] - (1 - lam) * sim_to_sel
-        pick_local = int(np.argmax(scores))
-        pick = cand[pick_local]
-        selected.append(pick)
-        cand.remove(pick)
-    return selected
-
 # ---------- Retrieval + context (RAG subset) ----------
-def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 50,
-                      per_doc_cap: int = 2, lam: float = 0.5):
+def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
+                      per_doc_cap: int = 2):
     """
-    Query Pinecone widely, diversify with MMR, cap per Doc_ID, and return:
-      - rows: list of normalized metadata dicts per match
-      - context: stitched text chunks for GPT to cite
+    Query Pinecone for a large candidate set, then:
+      1) pick by highest score while capping per Doc_ID to avoid duplicates
+      2) if still short, do a second pass ignoring the cap so we always reach top_k
+    NOTE: This version does NOT require embedding values (no MMR). It uses scores.
     """
+    # 1) Embed the question
     qvec = _embed_query(question)
+
+    # 2) Query wide. Do NOT ask for values; many indexes don't return them.
     res = index.query(
         vector=qvec,
         top_k=candidate_k,
         include_metadata=True,
-        include_values=True,
+        include_values=False,   # <-- important: we don't rely on raw vectors
         namespace=NAMESPACE
     )
-    # v3 client returns an object; be robust to dict-like too
+
+    # Pinecone response can be object-like or dict-like
     try:
-        matches = res.matches  # type: ignore
+        matches = res.matches  # type: ignore[attr-defined]
     except Exception:
-        matches = (res.get("matches") or [])  # type: ignore
+        matches = (res.get("matches") or [])  # type: ignore[index]
 
     if not matches:
         return [], ""
 
-    vecs, rows = [], []
+    # 3) Normalize into a list of (score, row_dict, content, doc_id)
+    items = []
     for m in matches:
         try:
-            values = m.values  # type: ignore
-            metadata = m.metadata or {}  # type: ignore
+            md = m.metadata or {}            # object style
+            score = float(m.score)           # object style
         except Exception:
-            values = m.get("values")
-            metadata = m.get("metadata") or {}
+            md = m.get("metadata") or {}     # dict style
+            score = float(m.get("score", 0.0))
 
-        if not values or not metadata:
-            continue
-
-        # Build content string if not present
+        # Build content string (fallback to key fields if no 'content')
         content = (
-            metadata.get("Content")
-            or metadata.get("content")
-            or metadata.get("text_chunk")
+            md.get("Content")
+            or md.get("content")
+            or md.get("text_chunk")
             or ""
-        ).strip()
+        )
+        content = str(content).strip()
+
         if not content:
             # Construct readable fallback from your schema
             content = (
-                f"Doc_ID:{metadata.get('Doc_ID') or metadata.get('document_id') or ''} | "
-                f"Employee:{(metadata.get('Employee') or '').strip()} ({(metadata.get('Employee ID') or '').strip()}) | "
-                f"Approver:{(metadata.get('Default Approver') or '').strip()} ({(metadata.get('Default Approver ID') or '').strip()}) | "
-                f"Approved Amount (rpt):{metadata.get('Approved Amount (rpt)')} | "
-                f"Expense Amount (rpt):{metadata.get('Expense Amount (rpt)')} | "
-                f"Expense Type:{(metadata.get('Expense Type') or '').strip()} | "
-                f"Vendor:{(metadata.get('Vendor') or '').strip()} | "
-                f"Cost Center:{(metadata.get('Cost Center') or '').strip()} | "
-                f"Transaction Date:{metadata.get('Transaction Date')}"
+                f"Doc_ID:{md.get('Doc_ID') or md.get('ID') or md.get('document_id') or ''} | "
+                f"Employee:{(md.get('Employee') or '').strip()} ({(md.get('Employee ID') or md.get('EmployeeID') or '').strip()}) | "
+                f"Approver:{(md.get('Default Approver') or '').strip()} ({(md.get('Default Approver ID') or '').strip()}) | "
+                f"Approved Amount (rpt):{md.get('Approved Amount (rpt)')} | "
+                f"Expense Amount (rpt):{md.get('Expense Amount (rpt)')} | "
+                f"Expense Type:{(md.get('Expense Type') or '').strip()} | "
+                f"Vendor:{(md.get('Vendor') or '').strip()} | "
+                f"Cost Center:{(md.get('Cost Center') or '').strip()} | "
+                f"Transaction Date:{md.get('Transaction Date')}"
             ).strip()
 
-        row = dict(metadata)
+        doc_id = (
+            md.get("Doc_ID")
+            or md.get("ID")
+            or md.get("document_id")
+            or md.get("DocID")
+            or "unknown"
+        )
+
+        row = dict(md)
         row["__content__"] = content
-        row["__doc_id__"] = metadata.get("Doc_ID") or metadata.get("document_id") or metadata.get("DocID") or "unknown"
+        row["__doc_id__"] = str(doc_id)
 
-        vecs.append(values)
-        rows.append(row)
+        items.append((score, row, content, str(doc_id)))
 
-    if not vecs:
+    if not items:
         return [], ""
 
-    doc_embs = np.array(vecs, dtype=np.float32)
-    q = np.array(qvec, dtype=np.float32)
+    # 4) Sort by score (desc)
+    items.sort(key=lambda x: x[0], reverse=True)
 
-    # Oversample, then prune with per-doc cap
-    selected = _mmr(doc_embs, q, k=min(top_k * 3, len(doc_embs)), lam=lam)
-
+    # 5) First pass: enforce per-doc cap
     per_doc_counts = {}
-    seen_snip = set()
     chosen_rows, context_chunks = [], []
-    for idx in selected:
-        r = rows[idx]
-        doc_id = str(r.get("__doc_id__", "unknown"))
-        txt = (r.get("__content__") or "").strip()
-        if not txt:
-            continue
-        key = (doc_id, txt[:160])
-        if key in seen_snip:
+    seen_snip = set()
+
+    for _, row, content, doc_id in items:
+        if len(context_chunks) >= top_k:
+            break
+        if not content:
             continue
         if per_doc_counts.get(doc_id, 0) >= per_doc_cap:
             continue
+        key = (doc_id, content[:160])
+        if key in seen_snip:
+            continue
 
-        chosen_rows.append(r)
-        context_chunks.append(txt)
+        chosen_rows.append(row)
+        context_chunks.append(content)
         per_doc_counts[doc_id] = per_doc_counts.get(doc_id, 0) + 1
         seen_snip.add(key)
 
-        if len(context_chunks) >= top_k:
-            break
+    # 6) Second pass: if still short, ignore per-doc cap to fill to top_k
+    if len(context_chunks) < top_k:
+        for _, row, content, doc_id in items:
+            if len(context_chunks) >= top_k:
+                break
+            if not content:
+                continue
+            key = (doc_id, content[:160])
+            if key in seen_snip:
+                continue
+            chosen_rows.append(row)
+            context_chunks.append(content)
+            seen_snip.add(key)
 
     context = "\n---\n".join(context_chunks)
     return chosen_rows, context
@@ -286,12 +275,6 @@ def _mutuals_and_rings(df: pd.DataFrame) -> dict:
     }
 
 # ---------- GLOBAL summaries (stored in Pinecone) ----------
-# We expect these fixed IDs to exist as vectors with metadata containing JSON-like dicts:
-#   "__summary__:totals" -> {"total_spend": float, "n_txns": int, "n_employees": int}
-#   "__summary__:top_spenders" -> {"items": [{"name": str, "spend": float}, ...]}
-#   "__summary__:top_categories" -> {"items": [{"category": str, "spend": float}, ...]}
-#   "__summary__:top_merchants" -> {"items": [{"merchant": str, "spend": float}, ...]}
-#   "__summary__:monthly_trend" -> {"items": [{"month": "YYYY-MM", "spend": float}, ...]}
 SUMMARY_IDS = [
     "__summary__:totals",
     "__summary__:top_spenders",
@@ -304,7 +287,6 @@ def _fetch_global_summaries():
     """Fetches summary docs by fixed IDs from Pinecone (namespace aware)."""
     try:
         res = index.fetch(ids=SUMMARY_IDS, namespace=NAMESPACE)
-        # v3 client has .vectors dict; be robust to both shapes
         vectors = getattr(res, "vectors", None)
         if vectors is None:
             vectors = res.get("vectors", {})  # type: ignore
@@ -359,20 +341,19 @@ def query_expense_gpt(question: str, top_k: int = 10):
         glob = _fetch_global_summaries()
         g_totals, g_spenders, g_cats, g_merch, g_monthly = _format_global_text(glob) if glob else (None, None, None, None, None)
 
-        # 2) Always retrieve diversified subset for examples + governance
+        # 2) Retrieve subset for examples + governance
         rows, context = _retrieve_context(
             question=question,
             top_k=top_k,
-            candidate_k=max(30, top_k * 5),
-            per_doc_cap=2,
-            lam=0.5
+            candidate_k=max(50, top_k * 10),  # query wider
+            per_doc_cap=2
         )
 
         df_subset = pd.DataFrame(rows) if rows else pd.DataFrame()
         subset_analytics = _build_subset_analytics(df_subset) if len(df_subset) else None
         subset_gov = _mutuals_and_rings(df_subset) if len(df_subset) else {"mutual_pairs": [], "cc_mutuals": [], "rings": []}
 
-        def fmt_pairs(pairs): 
+        def fmt_pairs(pairs):
             return "\n".join([f"{a} ⇄ {b}" for a, b in pairs]) if pairs else "None detected"
         def fmt_cc_mutuals(items):
             return "\n".join([f"{a} ⇄ {b} (Cost Center: {cc})" for a, b, cc in items]) if items else "None detected"
