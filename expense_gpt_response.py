@@ -5,7 +5,6 @@
 
 import os
 import re
-import json
 import pandas as pd
 import numpy as np
 import networkx as nx
@@ -36,24 +35,20 @@ def _embed_query(text: str) -> list:
 def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
                       per_doc_cap: int = 2):
     """
-    Query Pinecone for a large candidate set, then:
-      1) pick by highest score while capping per Doc_ID to avoid duplicates
-      2) if still short, do a second pass ignoring the cap so we always reach top_k
-    NOTE: This version does NOT require embedding values (no MMR). It uses scores.
+    Query Pinecone wide, rank by score, cap per Doc_ID (using metadata or match.id),
+    then fill to top_k.
     """
-    # 1) Embed the question
     qvec = _embed_query(question)
 
-    # 2) Query wide. Do NOT ask for values; many indexes don't return them.
     res = index.query(
         vector=qvec,
         top_k=candidate_k,
         include_metadata=True,
-        include_values=False,   # <-- important: we don't rely on raw vectors
+        include_values=False,   # we don't rely on raw vectors
         namespace=NAMESPACE
     )
 
-    # Pinecone response can be object-like or dict-like
+    # Handle object-like or dict-like response
     try:
         matches = res.matches  # type: ignore[attr-defined]
     except Exception:
@@ -62,17 +57,19 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
     if not matches:
         return [], ""
 
-    # 3) Normalize into a list of (score, row_dict, content, doc_id)
     items = []
     for m in matches:
+        # Extract metadata / score / match id robustly
         try:
-            md = m.metadata or {}            # object style
-            score = float(m.score)           # object style
+            md = m.metadata or {}              # object style
+            score = float(m.score)
+            match_id = getattr(m, "id", None)
         except Exception:
-            md = m.get("metadata") or {}     # dict style
+            md = m.get("metadata") or {}       # dict style
             score = float(m.get("score", 0.0))
+            match_id = m.get("id")
 
-        # Build content string (fallback to key fields if no 'content')
+        # Content to show the LLM (fallback if no 'content'-like field)
         content = (
             md.get("Content")
             or md.get("content")
@@ -80,9 +77,7 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
             or ""
         )
         content = str(content).strip()
-
         if not content:
-            # Construct readable fallback from your schema
             content = (
                 f"Doc_ID:{md.get('Doc_ID') or md.get('ID') or md.get('document_id') or ''} | "
                 f"Employee:{(md.get('Employee') or '').strip()} ({(md.get('Employee ID') or md.get('EmployeeID') or '').strip()}) | "
@@ -95,11 +90,13 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
                 f"Transaction Date:{md.get('Transaction Date')}"
             ).strip()
 
+        # CRITICAL FIX: Choose a proper doc id, falling back to the match id
         doc_id = (
             md.get("Doc_ID")
             or md.get("ID")
             or md.get("document_id")
             or md.get("DocID")
+            or match_id               # <--- fallback to Pinecone match id
             or "unknown"
         )
 
@@ -112,10 +109,10 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
     if not items:
         return [], ""
 
-    # 4) Sort by score (desc)
+    # Sort by score (desc)
     items.sort(key=lambda x: x[0], reverse=True)
 
-    # 5) First pass: enforce per-doc cap
+    # First pass: enforce per-doc cap
     per_doc_counts = {}
     chosen_rows, context_chunks = [], []
     seen_snip = set()
@@ -136,7 +133,7 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 200,
         per_doc_counts[doc_id] = per_doc_counts.get(doc_id, 0) + 1
         seen_snip.add(key)
 
-    # 6) Second pass: if still short, ignore per-doc cap to fill to top_k
+    # Second pass: if still short, ignore per-doc cap
     if len(context_chunks) < top_k:
         for _, row, content, doc_id in items:
             if len(context_chunks) >= top_k:
@@ -257,7 +254,7 @@ def _mutuals_and_rings(df: pd.DataFrame) -> dict:
           .to_dict()
     )
     cc_mutuals = []
-    for a, b in mutual_pairs:
+    for a, b in sorted(mutual_pairs):
         cc_a, cc_b = cc_map.get(a, ""), cc_map.get(b, "")
         if cc_a and cc_a == cc_b:
             cc_mutuals.append((a, b, cc_a))
@@ -284,7 +281,7 @@ SUMMARY_IDS = [
 ]
 
 def _fetch_global_summaries():
-    """Fetches summary docs by fixed IDs from Pinecone (namespace aware)."""
+    """Fetch summary docs by fixed IDs from Pinecone (namespace aware)."""
     try:
         res = index.fetch(ids=SUMMARY_IDS, namespace=NAMESPACE)
         vectors = getattr(res, "vectors", None)
@@ -302,7 +299,7 @@ def _fetch_global_summaries():
         return None
 
 def _format_global_text(glob):
-    """Make human-readable blocks from the fetched summaries."""
+    """Human-readable blocks from fetched summaries."""
     if not glob:
         return None, None, None, None, None
 
@@ -322,22 +319,21 @@ def _format_global_text(glob):
             lines.append(f"{i+1}. {str(label).strip()} — ${spend:,.2f}")
         return "\n".join(lines) if lines else "N/A"
 
-    top_spenders_text  = _fmt_list((glob.get("__summary__:top_spenders") or {}).get("items"),  "name")
+    top_spenders_text   = _fmt_list((glob.get("__summary__:top_spenders") or {}).get("items"),  "name")
     top_categories_text = _fmt_list((glob.get("__summary__:top_categories") or {}).get("items"), "category")
     top_merchants_text  = _fmt_list((glob.get("__summary__:top_merchants") or {}).get("items"),  "merchant")
 
     trend_items = (glob.get("__summary__:monthly_trend") or {}).get("items")
+    monthly_text = "N/A"
     if trend_items:
         monthly_text = "\n".join([f"{row.get('month')}: ${row.get('spend', 0.0):,.2f}" for row in trend_items])
-    else:
-        monthly_text = "N/A"
 
     return totals_text, top_spenders_text, top_categories_text, top_merchants_text, monthly_text
 
 # ---------- Main entry ----------
 def query_expense_gpt(question: str, top_k: int = 10):
     try:
-        # 1) Try to get global summaries from Pinecone (no CSV required)
+        # 1) GLOBAL summaries (if present)
         glob = _fetch_global_summaries()
         g_totals, g_spenders, g_cats, g_merch, g_monthly = _format_global_text(glob) if glob else (None, None, None, None, None)
 
@@ -345,7 +341,7 @@ def query_expense_gpt(question: str, top_k: int = 10):
         rows, context = _retrieve_context(
             question=question,
             top_k=top_k,
-            candidate_k=max(50, top_k * 10),  # query wider
+            candidate_k=max(50, top_k * 10),
             per_doc_cap=2
         )
 
@@ -366,16 +362,16 @@ def query_expense_gpt(question: str, top_k: int = 10):
 
         # RAG subset texts (for examples/explanations)
         if subset_analytics:
-            rag_top_spenders = "\n".join([f"{i+1}. {row['name']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_spenders"][:5])]) or "N/A"
+            rag_top_spenders   = "\n".join([f"{i+1}. {row['name']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_spenders"][:5])]) or "N/A"
             rag_top_categories = "\n".join([f"{i+1}. {row['category']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_categories"][:5])]) or "N/A"
-            rag_top_merchants = "\n".join([f"{i+1}. {row['merchant']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_merchants"][:5])]) or "N/A"
-            rag_monthly = "\n".join([f"{row['month']}: ${row['spend']:,.2f}" for row in subset_analytics["monthly_trend"]]) or "N/A"
-            rag_totals = f"spend=${subset_analytics['total_spend']:,.2f}, transactions={subset_analytics['n_txns']}, employees={subset_analytics['n_employees']}"
+            rag_top_merchants  = "\n".join([f"{i+1}. {row['merchant']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_merchants"][:5])]) or "N/A"
+            rag_monthly        = "\n".join([f"{row['month']}: ${row['spend']:,.2f}" for row in subset_analytics["monthly_trend"]]) or "N/A"
+            rag_totals         = f"spend=${subset_analytics['total_spend']:,.2f}, transactions={subset_analytics['n_txns']}, employees={subset_analytics['n_employees']}"
         else:
             rag_top_spenders = rag_top_categories = rag_top_merchants = rag_monthly = "N/A"
             rag_totals = "N/A"
 
-        # 3) Prompt — Prefer GLOBAL summaries if available; otherwise subset analytics.
+        # 3) Prompt
         prompt = f"""
 You are a travel & expense audit assistant.
 
