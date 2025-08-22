@@ -1,11 +1,11 @@
 # expense_gpt_response.py
-# Global analytics if a CSV is available; otherwise diversified RAG subset.
-# Env vars used:
+# Diversified RAG + optional GLOBAL summaries stored inside Pinecone (no CSV required).
+# Env vars:
 #   OPENAI_API_KEY, PINECONE_API_KEY, INDEX_NAME (e.g., auditexpense2), PINECONE_NAMESPACE (optional)
-#   EXPENSES_CSV_URL (optional) OR EXPENSES_CSV_PATH (optional) for global analytics
 
 import os
 import re
+import json
 import pandas as pd
 import numpy as np
 import networkx as nx
@@ -18,16 +18,13 @@ PINECONE_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("INDEX_NAME", "auditexpense2")
 NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
 
-CSV_URL = os.getenv("EXPENSES_CSV_URL")     # set one of these for global analytics
-CSV_PATH = os.getenv("EXPENSES_CSV_PATH")   # e.g., /data/expenses.csv
-
 client = OpenAI(api_key=OPENAI_KEY)
 pc = Pinecone(api_key=PINECONE_KEY)
 index = pc.Index(INDEX_NAME)
 
 # ---------- Embedding ----------
 def _embed_query(text: str) -> list:
-    """Embed with the same dimension as your index (1024). Exported for app.py debug endpoints."""
+    """Embed with same dimension as your index (1024). Exported for app.py debug endpoints."""
     emb = client.embeddings.create(
         model="text-embedding-3-large",
         input=text,
@@ -35,7 +32,7 @@ def _embed_query(text: str) -> list:
     ).data[0].embedding
     return emb
 
-# ---------- MMR reranking (for diversified RAG subset) ----------
+# ---------- MMR reranking (diversify retrieval) ----------
 def _l2norm(a: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
     return a / n
@@ -67,7 +64,7 @@ def _mmr(doc_embs: np.ndarray, query_emb: np.ndarray, k: int, lam: float = 0.5):
         cand.remove(pick)
     return selected
 
-# ---------- Retrieval + context (RAG subset path) ----------
+# ---------- Retrieval + context (RAG subset) ----------
 def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 50,
                       per_doc_cap: int = 2, lam: float = 0.5):
     """
@@ -83,41 +80,54 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 50,
         include_values=True,
         namespace=NAMESPACE
     )
-    matches = res.get("matches", []) or []
+    # v3 client returns an object; be robust to dict-like too
+    try:
+        matches = res.matches  # type: ignore
+    except Exception:
+        matches = (res.get("matches") or [])  # type: ignore
+
     if not matches:
         return [], ""
 
     vecs, rows = [], []
     for m in matches:
-        vals = m.get("values")
-        md = m.get("metadata") or {}
-        if not vals or not md:
+        try:
+            values = m.values  # type: ignore
+            metadata = m.metadata or {}  # type: ignore
+        except Exception:
+            values = m.get("values")
+            metadata = m.get("metadata") or {}
+
+        if not values or not metadata:
             continue
 
-        # Normalize and keep unified content/doc_id
-        norm = dict(md)
-        # Build fallback content from metadata if no 'content' field
+        # Build content string if not present
         content = (
-            md.get("Content") or md.get("content") or md.get("text_chunk") or ""
+            metadata.get("Content")
+            or metadata.get("content")
+            or metadata.get("text_chunk")
+            or ""
         ).strip()
         if not content:
-            # Construct a readable line from key fields you showed in your sample
+            # Construct readable fallback from your schema
             content = (
-                f"Doc_ID:{md.get('Doc_ID') or md.get('document_id') or ''} | "
-                f"Employee:{(md.get('Employee') or '').strip()} ({(md.get('Employee ID') or '').strip()}) | "
-                f"Approver:{(md.get('Default Approver') or '').strip()} ({(md.get('Default Approver ID') or '').strip()}) | "
-                f"Approved Amount (rpt):{md.get('Approved Amount (rpt)')} | "
-                f"Expense Amount (rpt):{md.get('Expense Amount (rpt)')} | "
-                f"Expense Type:{(md.get('Expense Type') or '').strip()} | "
-                f"Vendor:{(md.get('Vendor') or '').strip()} | "
-                f"Cost Center:{(md.get('Cost Center') or '').strip()} | "
-                f"Transaction Date:{md.get('Transaction Date')}"
+                f"Doc_ID:{metadata.get('Doc_ID') or metadata.get('document_id') or ''} | "
+                f"Employee:{(metadata.get('Employee') or '').strip()} ({(metadata.get('Employee ID') or '').strip()}) | "
+                f"Approver:{(metadata.get('Default Approver') or '').strip()} ({(metadata.get('Default Approver ID') or '').strip()}) | "
+                f"Approved Amount (rpt):{metadata.get('Approved Amount (rpt)')} | "
+                f"Expense Amount (rpt):{metadata.get('Expense Amount (rpt)')} | "
+                f"Expense Type:{(metadata.get('Expense Type') or '').strip()} | "
+                f"Vendor:{(metadata.get('Vendor') or '').strip()} | "
+                f"Cost Center:{(metadata.get('Cost Center') or '').strip()} | "
+                f"Transaction Date:{metadata.get('Transaction Date')}"
             ).strip()
 
-        norm["__content__"] = content
-        norm["__doc_id__"] = md.get("Doc_ID") or md.get("document_id") or md.get("DocID") or "unknown"
-        vecs.append(vals)
-        rows.append(norm)
+        row = dict(metadata)
+        row["__content__"] = content
+        row["__doc_id__"] = metadata.get("Doc_ID") or metadata.get("document_id") or metadata.get("DocID") or "unknown"
+
+        vecs.append(values)
+        rows.append(row)
 
     if not vecs:
         return [], ""
@@ -154,14 +164,14 @@ def _retrieve_context(question: str, top_k: int = 10, candidate_k: int = 50,
     context = "\n---\n".join(context_chunks)
     return chosen_rows, context
 
-# ---------- Column helpers ----------
+# ---------- Column helpers & analytics on retrieved subset ----------
+_amount_rx = re.compile(r"[^0-9\.-]+")
+
 def _first_col(df: pd.DataFrame, candidates: list[str], default: str | None = None):
     for c in candidates:
         if c in df.columns:
             return c
     return default
-
-_amount_rx = re.compile(r"[^0-9\.-]+")
 
 def _to_amount(series: pd.Series) -> pd.Series:
     if series is None:
@@ -171,39 +181,30 @@ def _to_amount(series: pd.Series) -> pd.Series:
 def _to_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce")
 
-# ---------- Analytics (shared) ----------
-def _build_analytics(df: pd.DataFrame) -> dict:
+def _build_subset_analytics(df: pd.DataFrame) -> dict:
     """
-    Compute aggregates:
-      - total_spend, n_txns, n_employees
-      - top_spenders, top_categories, top_merchants
-      - monthly_trend
-    Uses your schema: prefers 'Approved Amount (rpt)' then 'Expense Amount (rpt)'.
+    Aggregates from the retrieved subset only (NOT the whole corpus).
+    Used for examples/explanations; not for authoritative totals.
     """
     out = {}
 
-    # Prioritize your fields
     emp_col = _first_col(df, ["Employee", "Employee Name", "Employee_Name", "EmployeeID", "Employee ID"])
     emp_id_col = _first_col(df, ["Employee ID", "EmployeeID"])
     cat_col = _first_col(df, ["Expense Type", "Parent Expense Type Name", "Spend Category Code", "Category"])
     merch_col = _first_col(df, ["Vendor", "Merchant", "Merchant Name"])
-    # Amount preference: Approved -> Expense
     amt_col = _first_col(df, ["Approved Amount (rpt)", "Expense Amount (rpt)", "Total Amount", "Transaction Amount", "USD Amount", "Base Amount"])
     date_col = _first_col(df, ["Transaction Date", "Report Date", "Created Date", "Date", "Paid Date/Time"])
 
-    # Amounts
     if amt_col:
         df["_Amount"] = _to_amount(df[amt_col])
     else:
         df["_Amount"] = pd.Series([np.nan] * len(df))
 
-    # Dates
     if date_col:
         df["_Date"] = _to_date(df[date_col])
     else:
         df["_Date"] = pd.NaT
 
-    # Totals
     out["total_spend"] = float(np.nansum(df["_Amount"].values)) if len(df) else 0.0
     out["n_txns"] = int(len(df))
     if emp_id_col:
@@ -213,7 +214,6 @@ def _build_analytics(df: pd.DataFrame) -> dict:
     else:
         out["n_employees"] = None
 
-    # Top spenders
     top_spenders = []
     key = emp_col or emp_id_col
     if key:
@@ -221,21 +221,18 @@ def _build_analytics(df: pd.DataFrame) -> dict:
         top_spenders = [{"name": str(k).strip(), "spend": float(v)} for k, v in grp.items()]
     out["top_spenders"] = top_spenders
 
-    # Top categories
     top_categories = []
     if cat_col:
         grp = df.groupby(cat_col)["_Amount"].sum().sort_values(ascending=False).head(10)
         top_categories = [{"category": str(k).strip(), "spend": float(v)} for k, v in grp.items()]
     out["top_categories"] = top_categories
 
-    # Top merchants
     top_merchants = []
     if merch_col:
         grp = df.groupby(merch_col)["_Amount"].sum().sort_values(ascending=False).head(10)
         top_merchants = [{"merchant": str(k).strip(), "spend": float(v)} for k, v in grp.items()]
     out["top_merchants"] = top_merchants
 
-    # Monthly trend
     monthly_trend = []
     if "_Date" in df.columns and df["_Date"].notna().any():
         tmp = df.dropna(subset=["_Date"]).copy()
@@ -288,32 +285,81 @@ def _mutuals_and_rings(df: pd.DataFrame) -> dict:
         "rings": rings
     }
 
-# ---------- Global CSV (optional) ----------
-_GLOBAL_DF: pd.DataFrame | None = None
+# ---------- GLOBAL summaries (stored in Pinecone) ----------
+# We expect these fixed IDs to exist as vectors with metadata containing JSON-like dicts:
+#   "__summary__:totals" -> {"total_spend": float, "n_txns": int, "n_employees": int}
+#   "__summary__:top_spenders" -> {"items": [{"name": str, "spend": float}, ...]}
+#   "__summary__:top_categories" -> {"items": [{"category": str, "spend": float}, ...]}
+#   "__summary__:top_merchants" -> {"items": [{"merchant": str, "spend": float}, ...]}
+#   "__summary__:monthly_trend" -> {"items": [{"month": "YYYY-MM", "spend": float}, ...]}
+SUMMARY_IDS = [
+    "__summary__:totals",
+    "__summary__:top_spenders",
+    "__summary__:top_categories",
+    "__summary__:top_merchants",
+    "__summary__:monthly_trend",
+]
 
-def _load_global_df() -> pd.DataFrame | None:
-    global _GLOBAL_DF
-    if _GLOBAL_DF is not None:
-        return _GLOBAL_DF
+def _fetch_global_summaries():
+    """Fetches summary docs by fixed IDs from Pinecone (namespace aware)."""
     try:
-        if CSV_PATH and os.path.exists(CSV_PATH):
-            _GLOBAL_DF = pd.read_csv(CSV_PATH)
-        elif CSV_URL:
-            _GLOBAL_DF = pd.read_csv(CSV_URL)
-        else:
-            _GLOBAL_DF = None
-    except Exception as e:
-        print("⚠️ Failed to load global CSV:", e)
-        _GLOBAL_DF = None
-    return _GLOBAL_DF
+        res = index.fetch(ids=SUMMARY_IDS, namespace=NAMESPACE)
+        # v3 client has .vectors dict; be robust to both shapes
+        vectors = getattr(res, "vectors", None)
+        if vectors is None:
+            vectors = res.get("vectors", {})  # type: ignore
+        if not vectors:
+            return None
+
+        out = {}
+        for sid, vec in vectors.items():
+            md = getattr(vec, "metadata", None) or vec.get("metadata") or {}
+            out[sid] = md
+        return out if out else None
+    except Exception:
+        return None
+
+def _format_global_text(glob):
+    """Make human-readable blocks from the fetched summaries."""
+    if not glob:
+        return None, None, None, None, None
+
+    totals = glob.get("__summary__:totals") or {}
+    sp = totals.get("total_spend")
+    ntx = totals.get("n_txns")
+    ne = totals.get("n_employees")
+    totals_text = f"spend=${sp:,.2f}, transactions={ntx}, employees={ne}" if sp is not None else "N/A"
+
+    def _fmt_list(items, key):
+        if not items:
+            return "N/A"
+        lines = []
+        for i, row in enumerate(items[:10]):
+            label = row.get(key) or row.get("name") or row.get("category") or row.get("merchant") or "Unknown"
+            spend = row.get("spend", 0.0)
+            lines.append(f"{i+1}. {str(label).strip()} — ${spend:,.2f}")
+        return "\n".join(lines) if lines else "N/A"
+
+    top_spenders_text  = _fmt_list((glob.get("__summary__:top_spenders") or {}).get("items"),  "name")
+    top_categories_text = _fmt_list((glob.get("__summary__:top_categories") or {}).get("items"), "category")
+    top_merchants_text  = _fmt_list((glob.get("__summary__:top_merchants") or {}).get("items"),  "merchant")
+
+    trend_items = (glob.get("__summary__:monthly_trend") or {}).get("items")
+    if trend_items:
+        monthly_text = "\n".join([f"{row.get('month')}: ${row.get('spend', 0.0):,.2f}" for row in trend_items])
+    else:
+        monthly_text = "N/A"
+
+    return totals_text, top_spenders_text, top_categories_text, top_merchants_text, monthly_text
 
 # ---------- Main entry ----------
 def query_expense_gpt(question: str, top_k: int = 10):
     try:
-        # 0) Try to load global CSV once (if provided)
-        gdf = _load_global_df()
+        # 1) Try to get global summaries from Pinecone (no CSV required)
+        glob = _fetch_global_summaries()
+        g_totals, g_spenders, g_cats, g_merch, g_monthly = _format_global_text(glob) if glob else (None, None, None, None, None)
 
-        # 1) Always retrieve a diversified subset for context + governance patterns
+        # 2) Always retrieve diversified subset for examples + governance
         rows, context = _retrieve_context(
             question=question,
             top_k=top_k,
@@ -321,18 +367,11 @@ def query_expense_gpt(question: str, top_k: int = 10):
             per_doc_cap=2,
             lam=0.5
         )
-        if not rows and not gdf is not None:
-            return "I don’t know based on the provided context."
 
-        df_subset = pd.DataFrame(rows)
-        # Subset analytics (for narrative and when no CSV is provided)
-        subset_analytics = _build_analytics(df_subset) if len(df_subset) else None
+        df_subset = pd.DataFrame(rows) if rows else pd.DataFrame()
+        subset_analytics = _build_subset_analytics(df_subset) if len(df_subset) else None
         subset_gov = _mutuals_and_rings(df_subset) if len(df_subset) else {"mutual_pairs": [], "cc_mutuals": [], "rings": []}
 
-        # Global analytics if CSV is available (exact over your dataset)
-        global_analytics = _build_analytics(gdf) if gdf is not None and len(gdf) else None
-
-        # ---- Summaries for prompt ----
         def fmt_pairs(pairs): 
             return "\n".join([f"{a} ⇄ {b}" for a, b in pairs]) if pairs else "None detected"
         def fmt_cc_mutuals(items):
@@ -344,69 +383,45 @@ def query_expense_gpt(question: str, top_k: int = 10):
         subset_cc_mutuals = fmt_cc_mutuals(subset_gov["cc_mutuals"])
         subset_rings = fmt_rings(subset_gov["rings"])
 
-        def _fmt_top(items, key_name, k=5, label="name"):
-            if not items:
-                return "N/A"
-            lines = []
-            for i, row in enumerate(items[:k]):
-                klabel = row.get(key_name) or row.get(label) or "Unknown"
-                spend = row.get("spend", 0.0)
-                lines.append(f"{i+1}. {str(klabel).strip()} — ${spend:,.2f}")
-            return "\n".join(lines) if lines else "N/A"
-
-        # Subset (RAG) texts
+        # RAG subset texts (for examples/explanations)
         if subset_analytics:
-            rag_top_spenders = _fmt_top(subset_analytics["top_spenders"], "name")
-            rag_top_categories = _fmt_top(subset_analytics["top_categories"], "category")
-            rag_top_merchants = _fmt_top(subset_analytics["top_merchants"], "merchant")
-            rag_monthly = ("\n".join([f"{row['month']}: ${row['spend']:,.2f}" for row in subset_analytics["monthly_trend"]])
-                           if subset_analytics["monthly_trend"] else "N/A")
+            rag_top_spenders = "\n".join([f"{i+1}. {row['name']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_spenders"][:5])]) or "N/A"
+            rag_top_categories = "\n".join([f"{i+1}. {row['category']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_categories"][:5])]) or "N/A"
+            rag_top_merchants = "\n".join([f"{i+1}. {row['merchant']} — ${row['spend']:,.2f}" for i, row in enumerate(subset_analytics["top_merchants"][:5])]) or "N/A"
+            rag_monthly = "\n".join([f"{row['month']}: ${row['spend']:,.2f}" for row in subset_analytics["monthly_trend"]]) or "N/A"
             rag_totals = f"spend=${subset_analytics['total_spend']:,.2f}, transactions={subset_analytics['n_txns']}, employees={subset_analytics['n_employees']}"
         else:
             rag_top_spenders = rag_top_categories = rag_top_merchants = rag_monthly = "N/A"
             rag_totals = "N/A"
 
-        # Global texts
-        if global_analytics:
-            g_top_spenders = _fmt_top(global_analytics["top_spenders"], "name")
-            g_top_categories = _fmt_top(global_analytics["top_categories"], "category")
-            g_top_merchants = _fmt_top(global_analytics["top_merchants"], "merchant")
-            g_monthly = ("\n".join([f"{row['month']}: ${row['spend']:,.2f}" for row in global_analytics["monthly_trend"]])
-                         if global_analytics["monthly_trend"] else "N/A")
-            g_totals = f"spend=${global_analytics['total_spend']:,.2f}, transactions={global_analytics['n_txns']}, employees={global_analytics['n_employees']}"
-        else:
-            g_top_spenders = g_top_categories = g_top_merchants = g_monthly = g_totals = None  # not available
-
-        # ---- Prompt ----
-        # We give the model BOTH: exact global analytics (if CSV provided) and subset analytics (from RAG).
-        # Rule: Prefer GLOBAL analytics if available; otherwise use subset analytics.
+        # 3) Prompt — Prefer GLOBAL summaries if available; otherwise subset analytics.
         prompt = f"""
 You are a travel & expense audit assistant.
 
-Use the following data sources in this order of preference:
-1) GLOBAL analytics (exact, computed from the full CSV provided at startup), if present.
-2) SUBSET analytics (computed from the retrieved Pinecone rows), if global is not present.
+Use the following data sources in this order:
+1) GLOBAL summaries (exact, precomputed and stored inside Pinecone) — if present.
+2) SUBSET analytics (computed from the retrieved Pinecone rows) — if global summaries are not present.
 Never invent numbers. If neither contains the needed metric, say:
 "I don’t know based on the provided data."
 
-Context snippets (from Pinecone; helpful for citing examples):
+Context snippets (from Pinecone; for examples/citations):
 {context}
 
-GLOBAL analytics (exact over full dataset): {'[present]' if global_analytics else '[not available]'}
+GLOBAL summaries: {'[present]' if g_totals else '[not available]'}
 - Totals: {g_totals or 'N/A'}
 - Top spenders:
-{g_top_spenders or 'N/A'}
+{g_spenders or 'N/A'}
 
 - Top categories:
-{g_top_categories or 'N/A'}
+{g_cats or 'N/A'}
 
 - Top merchants:
-{g_top_merchants or 'N/A'}
+{g_merch or 'N/A'}
 
 - Monthly trend:
 {g_monthly or 'N/A'}
 
-SUBSET analytics (from retrieved context only): {'[present]' if subset_analytics else '[not available]'}
+SUBSET analytics (from retrieved rows only):
 - Totals: {rag_totals}
 - Top spenders:
 {rag_top_spenders}
@@ -420,8 +435,8 @@ SUBSET analytics (from retrieved context only): {'[present]' if subset_analytics
 - Monthly trend:
 {rag_monthly}
 
-Governance patterns from SUBSET rows:
-- Mutual Approval Pairs: 
+Governance patterns (from subset):
+- Mutual Approval Pairs:
 {subset_mutuals}
 - High-Risk Mutuals (same cost center):
 {subset_cc_mutuals}
@@ -432,9 +447,8 @@ User question:
 {question}
 
 Rules:
-- Prefer GLOBAL analytics if available; otherwise use SUBSET analytics.
-- Be concise and structured (bullets/tables ok).
-- If a requested metric isn’t available from the provided analytics, say you don’t know.
+- Prefer GLOBAL summaries when present; otherwise use SUBSET analytics.
+- Be concise and structured. If a requested metric isn’t present, state that clearly.
 """
 
         resp = client.chat.completions.create(
